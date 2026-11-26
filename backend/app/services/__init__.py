@@ -19,6 +19,7 @@ from app.services.bridge_link import BridgeLinkService
 from app.services.attr_decay import AttrDecayService
 from app.services.load_window import LoadWindowService
 from app.services.reprocess_task import ReprocessTaskService
+from app.services.pause_request import PauseRequestService
 from app.services.quality_gate import QualityGateService
 from app.services.lineage_edge import LineageEdgeService
 from app.services.dim_publish import DimPublishService
@@ -43,6 +44,7 @@ SERVICES: dict[str, BaseModuleService] = {
     "attr_decay": AttrDecayService(),
     "load_window": LoadWindowService(),
     "reprocess_task": ReprocessTaskService(),
+    "pause_request": PauseRequestService(),
     "quality_gate": QualityGateService(),
     "lineage_edge": LineageEdgeService(),
     "dim_publish": DimPublishService(),

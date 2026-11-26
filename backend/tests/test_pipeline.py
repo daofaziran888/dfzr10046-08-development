@@ -806,3 +806,209 @@ class TestDataEdgeCases:
         report = orch.status_report()
         for key in ["audit_log", "watermark", "scd", "fact", "quality", "reprocess", "snapshot"]:
             assert key in report, f"Missing key {key} in status_report"
+
+
+class TestPauseRequestFlow:
+    """暂停申请全链路：发起窗口申请 → 装载窗口待办 → 边界暂停 → 换班恢复。"""
+
+    def _running_task(self, task_no: str, table: str):
+        from app.services.reprocess_task import ReprocessTaskService
+        rp = ReprocessTaskService()
+        ok, _, entry = rp.schedule_reprocess(
+            task_no, "口径变更", table, "2026-10", "整段替换", "FACT-B001",
+        )
+        assert ok and entry is not None
+        got, _ = rp.run_action(int(entry["id"]), "排期重跑")
+        assert got is not None and got["status"] == "重跑中"
+        return rp, got
+
+    def _inflight_window(self, window_no: str, table: str):
+        from app.services.load_window import LoadWindowService
+        lw = LoadWindowService()
+        entry, missing = lw.create_entry({
+            "窗口编号": window_no, "所属事实表": table, "窗口起点": "2026-10-09",
+            "窗口终点": "2026-10-09", "预期行数": "1000", "实际行数": "",
+            "装载水位": "", "装载耗时": "",
+        })
+        assert not missing and entry is not None
+        got, _ = lw.run_action(int(entry["id"]), "启动装载")
+        assert got is not None and got["status"] == "装载中"
+        return lw, got
+
+    def _pause_of(self, task_no: str):
+        from app.services.pause_request import PauseRequestService
+        req = PauseRequestService().active_for_task(task_no)
+        assert req is not None
+        return req
+
+    def _todo_of(self, request_no: str):
+        from app.services.pause_request import PauseRequestService
+        todo = PauseRequestService().find_todo(request_no)
+        assert todo is not None
+        return todo
+
+    def test_drain_mode_full_flow(self):
+        """收完再停：冲突互斥 → 放行窗口收完自动停住 → 二班接手恢复，W9 类窗口无需重确认。"""
+        rp, task = self._running_task("RP-PA1", "暂停测试表A")
+        lw, window = self._inflight_window("W-A1", "暂停测试表A")
+
+        # 发起窗口：申请暂停 → 待送达（尚未交给装载班）
+        got, msg = rp.run_action(int(task["id"]), "申请暂停")
+        assert got is not None and got["status"] == "暂停申请中"
+        req = self._pause_of("RP-PA1")
+        assert req["status"] == "待送达"
+
+        # 重复申请被拒
+        rejected, _ = rp.run_action(int(task["id"]), "申请暂停")
+        assert rejected is None
+
+        # 发起窗口：送达装载班 → 待确认（装载班手上等决定），装载窗口生成一班待办
+        got, msg = rp.run_action(int(task["id"]), "送达装载班")
+        assert got is not None
+        assert req["status"] == "待确认"
+        todo = self._todo_of(req["申请编号"])
+        assert todo["status"] == "暂停待办"
+        assert todo["当班人"] == "一班"
+        assert "冲突" in msg and "W-A1" in msg
+
+        # 并发互斥：暂停待决期间在写窗口确认被暂扣（只能有一方推进）
+        blocked, msg = lw.run_action(int(window["id"]), "确认装载")
+        assert blocked is None and "暂扣" in msg
+
+        # 装载窗口：值班员决定收完再停 → 放行 W-A1，暂停等待收完
+        got, msg = lw.run_action(int(todo["id"]), "确认暂停·收完再停")
+        assert got is not None and "收完再停" in msg
+        assert req["status"] == "待确认" and req["放行窗口"] == "W-A1"
+
+        # 放行窗口收完 → 暂停自动生效，三方看到同一恢复位置
+        got, _ = lw.run_action(int(window["id"]), "确认装载")
+        assert got is not None and got["status"] == "已装载"
+        assert req["status"] == "已暂停"
+        boundary = req["恢复位置"]
+        assert "W-A1" in boundary and "之后" in boundary
+        assert req["待重确认窗口"] == ""  # 收完再停：恢复时无需重确认在写窗口
+        todo = self._todo_of(req["申请编号"])
+        task = rp.get_entry(int(task["id"]))
+        assert todo["装载水位"] == boundary
+        assert task["重跑水位"] == boundary
+        assert task["status"] == "已暂停" and todo["status"] == "已暂停"
+
+        # 已暂停期间不得启动新窗口
+        rejected, _ = lw.run_action(int(window["id"]), "启动装载")
+        assert rejected is None
+
+        # 刷新后二班接手：换班不改恢复位置，确认恢复直接生效（无需重确认 W-A1）
+        got, msg = lw.run_action(int(todo["id"]), "换班接手")
+        assert got is not None and got["当班人"] == "二班"
+        assert req["恢复位置"] == boundary
+        got, msg = lw.run_action(int(todo["id"]), "确认恢复")
+        assert got is not None and got["status"] == "已恢复"
+        assert req["status"] == "已恢复" and req["恢复当班"] == "二班"
+        assert rp.get_entry(int(task["id"]))["status"] == "重跑中"
+        # 已完成步骤不丢不补做：W-A1 保持已装载，未生成重复窗口
+        assert lw.get_entry(int(window["id"]))["status"] == "已装载"
+        same = [r for r in lw.list_entries()[0] if r.get("窗口编号") == "W-A1"]
+        assert len(same) == 1
+
+    def test_withhold_mode_requires_reconfirm(self):
+        """暂扣确认：保护已落下步骤，恢复前必须重确认在写窗口（W9 情形）。"""
+        rp, task = self._running_task("RP-PA2", "暂停测试表B")
+        lw, window = self._inflight_window("W-B1", "暂停测试表B")
+        window["实际行数"] = "800"  # 已落下的步骤
+
+        rp.run_action(int(task["id"]), "申请暂停")
+        rp.run_action(int(task["id"]), "送达装载班")
+        req = self._pause_of("RP-PA2")
+        todo = self._todo_of(req["申请编号"])
+
+        # 值班员决定暂扣确认 → 立即停住，在写窗口进入暂扣保护
+        got, msg = lw.run_action(int(todo["id"]), "确认暂停·暂扣确认")
+        assert got is not None
+        assert req["status"] == "已暂停"
+        assert lw.get_entry(int(window["id"]))["status"] == "暂扣中"
+        assert req["恢复位置"] == "W-B1（需重确认）"
+        assert req["待重确认窗口"] == "W-B1"
+
+        # 暂扣窗口受保护：不得中断丢弃已完成步骤
+        rejected, msg = lw.run_action(int(window["id"]), "标记中断")
+        assert rejected is None and "暂扣" in msg
+
+        # 恢复被拦：需先重确认 W-B1
+        rejected, msg = lw.run_action(int(todo["id"]), "确认恢复")
+        assert rejected is None and "W-B1" in msg
+
+        # 二班接手后重确认 W-B1：只确认不补做，已落下步骤保留
+        lw.run_action(int(todo["id"]), "换班接手")
+        got, _ = lw.run_action(int(window["id"]), "确认装载")
+        assert got is not None and got["status"] == "已装载"
+        assert got["实际行数"] == "800"
+        assert req["待重确认窗口"] == ""
+
+        # 实做恢复：任务回到重跑中，恢复位置双方一致
+        got, _ = lw.run_action(int(todo["id"]), "确认恢复")
+        assert got is not None and got["status"] == "已恢复"
+        assert rp.get_entry(int(task["id"]))["status"] == "重跑中"
+        assert req["恢复位置"] == "W-B1（需重确认）"
+        assert req["恢复位置"] == rp.get_entry(int(task["id"]))["重跑水位"]
+
+    def test_no_inflight_window_settles_immediately(self):
+        """无在写窗口：确认即停，边界取当前装载水位。"""
+        rp, task = self._running_task("RP-PA3", "暂停测试表C")
+        lw, window = self._inflight_window("W-C1", "暂停测试表C")
+        lw.run_action(int(window["id"]), "确认装载")  # 先收完，表内只剩已装载窗口
+
+        rp.run_action(int(task["id"]), "申请暂停")
+        rp.run_action(int(task["id"]), "送达装载班")
+        req = self._pause_of("RP-PA3")
+        todo = self._todo_of(req["申请编号"])
+        got, msg = lw.run_action(int(todo["id"]), "确认暂停·收完再停")
+        assert got is not None and "无在写窗口" in msg
+        assert req["status"] == "已暂停"
+        assert req["恢复位置"] == "水位2026-10-09之后"
+        assert rp.get_entry(int(task["id"]))["重跑水位"] == req["恢复位置"]
+
+        got, _ = lw.run_action(int(todo["id"]), "确认恢复")
+        assert got is not None
+        assert rp.get_entry(int(task["id"]))["status"] == "重跑中"
+
+    def test_guards(self):
+        """入口守卫：状态不符、暂停中完成任务、待办行误操作、手工登记均被拒。"""
+        from app.services.load_window import LoadWindowService
+        from app.services.pause_request import PauseRequestService
+        from app.services.reprocess_task import ReprocessTaskService
+
+        rp = ReprocessTaskService()
+        # 非重跑中任务不能申请暂停
+        ok, _, entry = rp.schedule_reprocess(
+            "RP-PA4", "口径变更", "暂停测试表D", "2026-10", "整段替换", "FACT-B001")
+        assert ok and entry is not None
+        rejected, msg = rp.run_action(int(entry["id"]), "申请暂停")
+        assert rejected is None and "重跑中" in msg
+        # 未申请不能送达
+        rejected, _ = rp.run_action(int(entry["id"]), "送达装载班")
+        assert rejected is None
+
+        # 暂停申请中不得确认完成
+        rp.run_action(int(entry["id"]), "排期重跑")
+        rp.run_action(int(entry["id"]), "申请暂停")
+        rejected, msg = rp.run_action(int(entry["id"]), "确认完成")
+        assert rejected is None and "暂停" in msg
+
+        # 待办行不能执行窗口动作
+        rp.run_action(int(entry["id"]), "送达装载班")
+        req = self._pause_of("RP-PA4")
+        todo = self._todo_of(req["申请编号"])
+        lw = LoadWindowService()
+        rejected, msg = lw.run_action(int(todo["id"]), "启动装载")
+        assert rejected is None and "待办" in msg
+        # 普通窗口不能执行待办动作
+        _, w = self._inflight_window("W-D1", "暂停测试表E")
+        rejected, msg = lw.run_action(int(w["id"]), "确认暂停·收完再停")
+        assert rejected is None and "待办" in msg
+
+        # 暂停申请模块只读回查：手工登记与动作均被拒
+        pause = PauseRequestService()
+        entry2, missing = pause.create_entry({"申请编号": "PR-X", "重跑编号": "RP-X", "影响事实表": "T"})
+        assert entry2 is None and missing
+        rejected, _ = pause.run_action(1, "任意动作")
+        assert rejected is None

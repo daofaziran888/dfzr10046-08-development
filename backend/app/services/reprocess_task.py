@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.services.pause_request import PauseRequestService
 from app.store import store
 
 
@@ -12,9 +13,25 @@ class ReprocessTaskService(BaseModuleService):
     ENTITY = "重跑任务"
     LIST_FIELDS = ["重跑编号", "触发原因", "影响事实表", "重跑区间", "覆盖策略", "依赖批次", "重跑水位", "重跑耗时"]
     REQUIRED_FIELDS = ["重跑编号", "触发原因", "影响事实表"]
-    STATUS_ORDER = ["待排期", "重跑中", "已完成", "重跑失败"]
+    STATUS_ORDER = ["待排期", "重跑中", "暂停申请中", "已暂停", "已完成", "重跑失败"]
     ACTION_RULES = {"排期重跑": "重跑中", "确认完成": "已完成", "标记失败": "重跑失败"}
     NEGATIVE_ACTIONS = ["标记失败"]
+
+    def run_action(self, entry_id: int, action: str):
+        """暂停入口：申请暂停/送达装载班；暂停流程未完结时冻结完成与失败。"""
+        entry = store.find(self.MODULE, entry_id)
+        if entry is None:
+            return None, f"{self.ENTITY} {entry_id} 不存在或已归档"
+        pause = PauseRequestService()
+        if action == "申请暂停":
+            ok, message, _req = pause.create_request(entry)
+            return (entry if ok else None), message
+        if action == "送达装载班":
+            ok, message = pause.deliver(entry)
+            return (entry if ok else None), message
+        if action in ("确认完成", "标记失败") and entry.get("status") in ("暂停申请中", "已暂停"):
+            return None, f"暂停流程未完结（{entry.get('status')}），不能{action}，请先处理暂停申请"
+        return super().run_action(entry_id, action)
 
     def schedule_reprocess(
         self, task_id: str, reason: str, target_table: str,
